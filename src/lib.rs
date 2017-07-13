@@ -1,35 +1,141 @@
+extern crate serial;
+extern crate serial_core;
+
 use std::io;
 use std::io::{Read, Write, BufRead, BufReader};
 use std::result::Result;
 use std::convert::From;
 
-trait Bootloader: Read + Write {
-    fn transmit(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        self.write(data)?;
+enum BootloaderCommand {
+    VerifyChecksum,
+    GetFlashSize,
+    GetAppStatus,
+    EraseRow,
+    Sync,
+    SetActiveApp,
+    SendData,
+    EnterBootloader,
+    ProgramRow,
+    VerifyRow,
+    ExitBootloader,
+    GetMetaData,
+}
 
-        let mut recv = Vec::new();
-        self.read_to_end(&mut recv)?;
+impl Into<u8> for BootloaderCommand {
+    fn into(self) -> u8 {
+        match self {
+            BootloaderCommand::VerifyChecksum => 0x31,
+            BootloaderCommand::GetFlashSize => 0x32,
+            BootloaderCommand::GetAppStatus => 0x33,
+            BootloaderCommand::EraseRow => 0x34,
+            BootloaderCommand::Sync => 0x35,
+            BootloaderCommand::SetActiveApp => 0x36,
+            BootloaderCommand::SendData => 0x37,
+            BootloaderCommand::EnterBootloader => 0x38,
+            BootloaderCommand::ProgramRow => 0x39,
+            BootloaderCommand::VerifyRow => 0x3A,
+            BootloaderCommand::ExitBootloader => 0x3B,
+            BootloaderCommand::GetMetaData => 0x3C,
+        }
+    }
+}
 
-        Ok(recv)
+trait Bootloader: Read + Write + Sized {
+    fn transmit(&mut self, tx_data: &[u8], response: bool) -> Result<Vec<u8>, Error> {
+        self.write_all(tx_data)?;
+
+        if response {
+            let mut header = [0u8; 4];
+            self.read_exact(&mut header)?;
+
+            if header[0] != 0x01 {
+                return Err(Error::Bootloader(BootloaderError::Data));
+            }
+
+            if header[1] != 0x00 {
+                return Err(Error::Bootloader(BootloaderError::from(header[1])));
+            }
+
+            let len = (header[2] as u16) | ((header[3] as u16) << 8);
+            let mut rx_data = Vec::new();
+            Read::by_ref(self).take(len as u64).read_to_end(&mut rx_data)?;
+
+            let mut footer = [0u8; 3];
+            self.read_exact(&mut footer);
+
+            let checksum: u16 = header.iter().chain(rx_data.iter()).fold(0u16, |a,b| a+(*b as u16));
+            let checksum = 1 + !checksum;
+            let packet_checksum = (footer[0] as u16) | ((footer[1] as u16) << 8);
+
+            if packet_checksum != checksum {
+                return Err(Error::Bootloader(BootloaderError::Checksum));
+            }
+
+            if footer[2] != 0x17 {
+                return Err(Error::Bootloader(BootloaderError::Data));
+            }
+
+            Ok(rx_data)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn create_packet(cmd: BootloaderCommand, data: Option<&[u8]>) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(0x01);
+        packet.push(cmd.into());
+        if let Some(data) = data {
+            let len = data.len() as u16;
+            packet.push(len as u8);
+            packet.push((len >> 8) as u8);
+            packet.extend_from_slice(data);
+        } else {
+            packet.push(0x00);
+            packet.push(0x00);
+        }
+        let checksum: u16 = packet.iter().fold(0u16, |a,b| a+(*b as u16));
+        let checksum = 1 + !checksum;
+        packet.push(checksum as u8);
+        packet.push((checksum >> 8) as u8);
+        packet.push(0x17);
+        packet
     }
 
     fn start_bootloader(&mut self, header: &CyacdHeader) -> Result<(), Error> {
-        println!("STARTING");
+        let packet = Self::create_packet(BootloaderCommand::EnterBootloader, None);
+        let mut res = self.transmit(&packet, true)?;
         Ok(())
     }
 
     fn stop_bootloader(&mut self) -> Result<(), Error> {
-        println!("STOPPING");
+        let packet = Self::create_packet(BootloaderCommand::ExitBootloader, None);
+        let mut res = self.transmit(&packet, false)?;
         Ok(())
     }
 
     fn program_row(&mut self, row: &FlashRow) -> Result<(), Error> {
-        println!("PROGRAMMING ROW");
+        let max_size = 50;
+        let mut offset = 0;
+        while row.data[offset..].len() > max_size {
+            let start = offset as usize;
+            let packet = Self::create_packet(BootloaderCommand::SendData, Some(&row.data[(offset as usize)..(offset as usize + max_size)]));
+            self.transmit(&packet, true)?;
+            offset += max_size;
+        }
+
+        let mut data = vec![row.array_id, row.row_num as u8, (row.row_num >> 8) as u8];
+        data.extend_from_slice(&row.data[(offset as usize)..]);
+        let packet = Self::create_packet(BootloaderCommand::ProgramRow, Some(&data));
+        let mut res = self.transmit(packet.as_slice(), true)?;
+
         Ok(())
     }
 
     fn verify_row(&mut self, row: &FlashRow) -> Result<(), Error> {
-        println!("VERIFYING ROW");
+        let mut data = vec![row.array_id, row.row_num as u8, (row.row_num >> 8) as u8];
+        let packet = Self::create_packet(BootloaderCommand::VerifyRow, Some(&data));
+        let mut res = self.transmit(packet.as_slice(), true)?;
         Ok(())
     }
 }
@@ -73,6 +179,24 @@ pub enum BootloaderError {
     Active,
     Callback,
     Unknown,
+}
+
+impl From<u8> for BootloaderError {
+    fn from(value: u8) -> BootloaderError {
+        match value {
+            0x03 => BootloaderError::Length,
+            0x04 => BootloaderError::Data,
+            0x05 => BootloaderError::Command,
+            0x08 => BootloaderError::Checksum,
+            0x09 => BootloaderError::Array,
+            0x0A => BootloaderError::Row,
+            0x0C => BootloaderError::App,
+            0x0D => BootloaderError::Active,
+            0x0E => BootloaderError::Callback,
+            0x0F => BootloaderError::Unknown,
+            _ => BootloaderError::Unknown,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -193,6 +317,7 @@ where
     let mut input = BufReader::new(input);
 
     let header = parse_header(&mut input)?;
+    comm.open();
     comm.start_bootloader(&header)?;
 
     loop {
@@ -215,40 +340,66 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::serial;
+    use super::serial_core::{SerialDevice, SerialPortSettings, FlowControl};
+
     use std::fs::File;
     use std::io;
     use std::io::{Read, Write, BufRead, BufReader};
+    use std::mem;
+    use std::time::Duration;
 
-    struct Comm;
+    struct Comm {
+        device: Option<serial::SystemPort>,
+    }
 
     impl super::Connection for Comm {
         fn open(&mut self) -> bool {
+            let mut device = serial::open("COM6").unwrap();
+            device.set_timeout(Duration::from_secs(1)).unwrap();
+            let mut settings = SerialDevice::read_settings(&device).unwrap();
+            settings.set_flow_control(FlowControl::FlowNone);
+            device.write_settings(&settings);
+            mem::replace(&mut self.device, Some(device));
             true
         }
 
         fn close(&mut self) -> bool {
+            mem::replace(&mut self.device, None);
             true
         }
     }
 
     impl Read for Comm {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
+            if let Some(ref mut device) = self.device {
+                device.read(buf)
+            } else {
+                Err(io::Error::new(io::ErrorKind::NotConnected, "serial connection lost"))
+            }
         }
     }
 
     impl Write for Comm {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            Ok(0)
+            if let Some(ref mut device) = self.device {
+                device.write(buf)
+            } else {
+                Err(io::Error::new(io::ErrorKind::NotConnected, "serial port closed"))
+            }
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            if let Some(ref mut device) = self.device {
+                device.flush()
+            } else {
+                Err(io::Error::new(io::ErrorKind::NotConnected, "serial port closed"))
+            }
         }
     }
 
     #[test]
     fn it_works() {
-        super::bootload(File::open("test.cyacd").unwrap(), Comm {}).unwrap();
+        super::bootload(File::open("Design01.cyacd").unwrap(), Comm {device: None}).unwrap();
     }
 }

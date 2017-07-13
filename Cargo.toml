@@ -4,3 +4,5 @@ version = "0.1.0"
 authors = ["Robby Madruga <robbymadruga@gmail.com>"]
 
 [dependencies]
+serial = "0.4.0"
+serial-core = "0.4.0"
